@@ -1,0 +1,82 @@
+{
+  "target_municipalities": [
+    {
+      "name": "Toronto",
+      "province": "Ontario",
+      "population": 2794356,
+      "data_source": "Toronto Open Data Portal (CKAN)",
+      "data_format": "CSV with GeoJSON geometry",
+      "data_url": "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/zoning-by-law",
+      "notes": "Richest dataset; direct ingestion with coordinates"
+    },
+    {
+      "name": "Ottawa",
+      "province": "Ontario",
+      "population": 1017449,
+      "data_source": "Ottawa Open Data Portal",
+      "data_format": "ArcGIS REST with GeoJSON",
+      "data_url": "https://open.ottawa.ca/datasets/zoning",
+      "notes": "Open data portal, civic.band presence"
+    },
+    {
+      "name": "Mississauga",
+      "province": "Ontario",
+      "population": 717961,
+      "data_source": "City of Mississauga website",
+      "data_format": "Interactive viewer + PDF bylaws",
+      "data_url": "https://www.mississauga.ca/services-and-programs/building-and-renovating/zoning/",
+      "notes": "Requires agentic scraping of PDF bylaws"
+    },
+    {
+      "name": "Hamilton",
+      "province": "Ontario",
+      "population": 569353,
+      "data_source": "City of Hamilton open data",
+      "data_format": "PDF bylaws + open data",
+      "data_url": "https://open.hamilton.ca/",
+      "notes": "civic.band presence, open data portal"
+    },
+    {
+      "name": "Brampton",
+      "province": "Ontario",
+      "population": 656480,
+      "data_source": "City of Brampton website",
+      "data_format": "PDF bylaws",
+      "data_url": "https://www.brampton.ca/en/Business/planning-development/zoning/Pages/welcome.aspx",
+      "notes": "civic.band presence, primarily PDF-based"
+    },
+    {
+      "name": "London",
+      "province": "Ontario",
+      "population": 422324,
+      "data_source": "City of London website",
+      "data_format": "PDF bylaws",
+      "data_url": "https://london.ca/by-laws/zoning-by-law",
+      "notes": "civic.band presence"
+    },
+    {
+      "name": "Markham",
+      "province": "Ontario",
+      "population": 338503,
+      "data_source": "City of Markham website",
+      "data_format": "PDF bylaws",
+      "data_url": "https://www.markham.ca/wps/portal/home/business/planning/zoning-by-law",
+      "notes": "Optional target, PDF-based"
+    },
+    {
+      "name": "Kitchener",
+      "province": "Ontario",
+      "population": 256885,
+      "data_source": "City of Kitchener website",
+      "data_format": "PDF bylaws + interactive map",
+      "data_url": "https://www.kitchener.ca/en/development-and-construction/zoning-by-law.aspx",
+      "notes": "Optional target, Kitchener-Waterloo region"
+    }
+  ],
+  "metadata": {
+    "focus_province": "Ontario",
+    "schema_version": "1.0",
+    "license": "CC BY 4.0",
+    "notes": "Target cities selected for data accessibility. Platform is province-agnostic and designed for national scale expansion."
+  }
+}
