@@ -4,7 +4,7 @@ scraping, extracting, and storing municipal zoning data.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Annotated, Any, Callable, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -47,26 +47,30 @@ TOOLS = [search_web, scrape_webpage, download_and_extract_pdf, download_image]
 SYSTEM_PROMPT = """\
 You are a municipal data research agent specialising in Canadian zoning bylaws and land use regulations.
 
-Your goal is to find and extract comprehensive zoning regulation data for a given Canadian municipality.
+Your goal is to find and extract COMPREHENSIVE zoning regulation data for a given Canadian municipality. Be thorough -- scrape many pages and download all relevant PDFs.
 
 ## Workflow
 
 1. **Search** for the municipality's official zoning bylaw page using search_web.
-   - Try the municipality's official website first.
-   - Also search civic.band (e.g. "civic.band {municipality} zoning") -- it aggregates Canadian municipal data.
-   - Also check open data portals (e.g. open.toronto.ca, opendata.vancouver.ca).
+   - Try multiple search queries: "{municipality} zoning bylaw", "{municipality} official plan", "civic.band {municipality}".
+   - Also search for open data portals (e.g. "{municipality} open data zoning").
 2. **Scrape** the main zoning bylaw page using scrape_webpage. Look for:
    - Links to specific zone category pages (residential, commercial, industrial, mixed-use)
-   - Links to PDF bylaw documents
+   - Links to PDF bylaw documents (listed under "PDF documents found on this page")
    - Zoning tables, permitted-use tables, development-standard tables
-3. **Follow links** systematically: scrape sub-pages for each zone category to get complete data.
-4. **Download** any PDF zoning bylaws using download_and_extract_pdf.
+3. **IMPORTANT: Download ALL PDF documents** you find using download_and_extract_pdf.
+   - Look at "PDF documents found on this page" at the bottom of each scraped page.
+   - PDF zoning bylaws are THE MOST VALUABLE data source -- they contain the detailed tables and regulations.
+   - Download at least 2-3 PDFs if available. More is better.
+   - Common PDF names: zoning_bylaw, zoning-schedule, permitted-uses, development-standards.
+4. **Follow links** systematically: scrape sub-pages for each zone category to get complete data.
+   - Aim to scrape at LEAST 5 different pages/documents.
+   - Residential, commercial, industrial, and mixed-use zones should each be explored separately if possible.
 5. **Download images** of zoning maps, land use maps, or setback diagrams using download_image.
-   - When scraping a page, look at the "Images found on this page" section at the bottom.
+   - Look at "Images found on this page" at the bottom of each scraped page.
    - Download images that appear to be zoning maps, land use maps, or technical diagrams.
    - Skip logos, icons, photos of buildings, or decorative images.
-   - Look for URLs containing "map", "zoning", "land-use", "diagram", "schedule".
-6. After gathering enough text (aim for at least 3-5 different pages/documents), respond with "EXTRACTION_READY" followed by all the zoning text you've collected.
+6. Only after you have gathered data from at least 5 pages/documents AND downloaded available PDFs, respond with "EXTRACTION_READY".
 
 ## Known URL Patterns for Canadian Municipalities
 
@@ -81,10 +85,9 @@ Many Canadian municipal sites follow these patterns:
 
 - Focus on OFFICIAL government websites (.ca domain preferred).
 - Do NOT scrape the same URL twice -- keep track of which pages you've visited.
-- Look for: zoning bylaws, zoning maps, permitted-use tables, development standards.
-- Download PDFs of zoning bylaw sections, especially residential and commercial zones.
-- Be efficient: don't scrape irrelevant pages.
-- Always note the exact URLs you scraped.
+- ALWAYS download PDFs when you see them listed. PDFs are the primary source of zoning data.
+- Be thorough: visit multiple sub-pages for different zone categories.
+- Do NOT stop after just 1-2 pages. Keep exploring until you have comprehensive coverage.
 - Record bylaw numbers (e.g. "By-law 569-2013") and effective dates when visible.
 - Rate limit: wait between requests (the tools handle this).
 
@@ -107,10 +110,11 @@ For each zone, look for ALL of these:
 - Pay attention to "Schedule" or "Appendix" sections in bylaws -- these often contain the key data tables.
 
 ## Data Priority
-1. Municipal official websites
-2. civic.band (aggregated Canadian municipal data)
-3. Open data portals (CKAN, ArcGIS REST)
-4. Planning department pages
+1. PDF bylaw documents (MOST VALUABLE -- always download these)
+2. Municipal official websites
+3. civic.band (aggregated Canadian municipal data)
+4. Open data portals (CKAN, ArcGIS REST)
+5. Planning department pages
 """
 
 
@@ -157,10 +161,14 @@ def _count_tool_rounds(messages: list) -> int:
     return sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
 
 
+MIN_TOOL_ROUNDS = 5
+
+
 async def should_continue(state: AgentState) -> str:
     """Decide whether to continue tool calls or move to extraction.
-    Requires at least 2 tool call rounds before allowing non-explicit extraction,
-    preventing premature extraction on insufficient data."""
+    Requires at least MIN_TOOL_ROUNDS tool call rounds before allowing
+    non-explicit extraction, preventing premature extraction on
+    insufficient data."""
     last_message = state["messages"][-1]
 
     if isinstance(last_message, AIMessage):
@@ -169,7 +177,7 @@ async def should_continue(state: AgentState) -> str:
         content = _msg_text(last_message)
         if "EXTRACTION_READY" in content:
             return "extract"
-        if _count_tool_rounds(state["messages"]) < 2:
+        if _count_tool_rounds(state["messages"]) < MIN_TOOL_ROUNDS:
             return "agent"
     return "extract"
 
@@ -249,13 +257,16 @@ async def run_pipeline_for_municipality(
     4. Upsert: delete old data, store new data
     5. Chunk + embed for RAG
     """
-    _notify(progress_callback, "started", {"municipality": municipality})
+    _notify(progress_callback, "started", {"municipality": municipality, "province": province})
     print(f"\n{'='*60}")
     print(f"Processing: {municipality}, {province}")
     print(f"{'='*60}")
 
     # Step 1: Discover and scrape
-    _notify(progress_callback, "discovering", {"municipality": municipality})
+    _notify(progress_callback, "discovering", {
+        "municipality": municipality,
+        "message": f"Searching the web for {municipality} zoning bylaws and official plans",
+    })
     print("[1/6] Running agent to discover and scrape zoning data...")
     graph = build_agent_graph()
 
@@ -280,15 +291,20 @@ async def run_pipeline_for_municipality(
         "status": "started",
     }
 
+    _notify(progress_callback, "scraping", {
+        "message": f"AI agent is browsing and scraping zoning data for {municipality}",
+        "detail": "Searching official websites, civic.band, and open data portals",
+    })
+
     try:
-        result = await graph.ainvoke(initial_state, {"recursion_limit": 25})
+        result = await graph.ainvoke(initial_state, {"recursion_limit": 40})
     except Exception as e:
         err_msg = str(e)
         if "recursion" in err_msg.lower():
             print(f"  [WARN] Agent hit recursion limit -- proceeding with partial data")
             result = initial_state
         else:
-            _notify(progress_callback, "failed", {"error": err_msg})
+            _notify(progress_callback, "failed", {"error": err_msg, "message": f"Agent error: {err_msg}"})
             print(f"  [ERROR] Agent failed: {err_msg}")
             return {"municipality": municipality, "regulations": 0, "status": "agent_error", "error": err_msg}
 
@@ -299,17 +315,28 @@ async def run_pipeline_for_municipality(
         source_urls = _extract_urls_from_messages(result.get("messages", []))
 
     if not collected_text or len(collected_text) < 100:
-        _notify(progress_callback, "failed", {"error": "insufficient_data"})
+        _notify(progress_callback, "failed", {
+            "error": "insufficient_data",
+            "message": "Could not find enough zoning data — try a different municipality",
+        })
         print("  [WARN] Agent collected insufficient text, skipping extraction")
         return {"municipality": municipality, "regulations": 0, "status": "insufficient_data"}
 
-    _notify(progress_callback, "scraping", {"chars_collected": len(collected_text)})
+    _notify(progress_callback, "scraping_done", {
+        "chars_collected": len(collected_text),
+        "urls_scraped": len(source_urls),
+        "urls": source_urls[:10],
+        "message": f"Scraped {len(source_urls)} pages — {len(collected_text):,} characters collected",
+    })
     print(f"  Collected {len(collected_text)} characters of text from {len(source_urls)} URLs")
 
     primary_source_url = source_urls[0] if source_urls else f"https://www.{municipality.lower().replace(' ', '')}.ca"
 
     # Step 2: Extract structured zoning data
-    _notify(progress_callback, "extracting", {"municipality": municipality})
+    _notify(progress_callback, "extracting", {
+        "municipality": municipality,
+        "message": f"Using AI to extract structured zoning regulations from {len(collected_text):,} chars of text",
+    })
     print("[2/6] Extracting structured zoning data...")
     regulations = await extract_zoning_from_text(
         raw_text=collected_text,
@@ -318,9 +345,16 @@ async def run_pipeline_for_municipality(
         source_url=primary_source_url,
         source_document=f"{municipality} Zoning Bylaw",
     )
+    _notify(progress_callback, "extracting_regulations_done", {
+        "regulations": len(regulations),
+        "message": f"Extracted {len(regulations)} zoning regulations (zones, setbacks, heights, etc.)",
+    })
     print(f"  Extracted {len(regulations)} zoning regulations")
 
     # Step 3: Extract official plan policies
+    _notify(progress_callback, "extracting_policies", {
+        "message": "Extracting official plan policies (growth targets, housing, transit)",
+    })
     print("[3/6] Extracting official plan policies...")
     policies = await extract_official_plan_from_text(
         raw_text=collected_text,
@@ -329,14 +363,24 @@ async def run_pipeline_for_municipality(
         source_url=primary_source_url,
         source_document=f"{municipality} Official Plan",
     )
+    _notify(progress_callback, "extracting_policies_done", {
+        "policies": len(policies),
+        "message": f"Extracted {len(policies)} official plan policies",
+    })
     print(f"  Extracted {len(policies)} official plan policies")
 
     if not regulations and not policies:
-        _notify(progress_callback, "failed", {"error": "extraction_failed"})
+        _notify(progress_callback, "failed", {
+            "error": "extraction_failed",
+            "message": "AI could not extract any structured data — the source text may not contain zoning info",
+        })
         return {"municipality": municipality, "regulations": 0, "policies": 0, "status": "extraction_failed"}
 
     # Step 4: Geocode
-    _notify(progress_callback, "geocoding", {"municipality": municipality})
+    _notify(progress_callback, "geocoding", {
+        "municipality": municipality,
+        "message": f"Looking up geographic coordinates for {municipality}, {province}",
+    })
     print("[4/6] Geocoding municipality...")
     coords = await geocode_municipality(municipality, province)
     geocode_failed = coords is None
@@ -348,7 +392,11 @@ async def run_pipeline_for_municipality(
     print(f"  Coordinates: {lat}, {lng}")
 
     # Step 5: Store in database (upsert -- delete old data first)
-    _notify(progress_callback, "storing", {"regulations": len(regulations), "policies": len(policies)})
+    _notify(progress_callback, "storing", {
+        "regulations": len(regulations),
+        "policies": len(policies),
+        "message": f"Saving {len(regulations)} regulations and {len(policies)} policies to database",
+    })
     print("[5/6] Storing in database (upsert)...")
     engine = get_async_engine(database_url)
     Session = get_async_session_factory(engine)
@@ -377,7 +425,7 @@ async def run_pipeline_for_municipality(
             latitude=lat,
             longitude=lng,
             data_sources=muni_data_sources,
-            last_updated=datetime.now(timezone.utc),
+            last_updated=datetime.utcnow(),
         )
         session.add(muni)
 
@@ -449,14 +497,17 @@ async def run_pipeline_for_municipality(
             url=primary_source_url,
             status="success",
             documents_found=len(regulations) + len(policies),
-            scraped_at=datetime.now(timezone.utc),
+            scraped_at=datetime.utcnow(),
         )
         session.add(log)
 
         await session.commit()
 
         # Step 6: Chunk + embed for RAG (text + PDF pages + images)
-        _notify(progress_callback, "embedding", {"municipality": municipality})
+        _notify(progress_callback, "embedding", {
+            "municipality": municipality,
+            "message": "Creating multimodal embeddings for AI knowledge base",
+        })
         print("[6/6] Chunking and embedding for RAG...")
 
         text_chunks = chunk_text(
@@ -483,6 +534,10 @@ async def run_pipeline_for_municipality(
             all_chunks.extend(page_chunks)
             pdf_bytes_list.append((pdf_bytes, pdf_url, f"{municipality} Zoning Bylaw"))
         if pdf_bytes_list:
+            _notify(progress_callback, "embedding_pdfs", {
+                "pdfs": len(pdf_bytes_list),
+                "message": f"Processing {len(pdf_bytes_list)} PDF documents for multimodal embedding",
+            })
             print(f"  Found {len(pdf_bytes_list)} cached PDFs for multimodal embedding")
 
         # Collect cached images for multimodal embedding
@@ -499,7 +554,18 @@ async def run_pipeline_for_municipality(
             ))
             image_data_list.append((img_bytes, mime_type))
         if image_data_list:
+            _notify(progress_callback, "embedding_images", {
+                "images": len(image_data_list),
+                "message": f"Processing {len(image_data_list)} zoning maps/diagrams for multimodal embedding",
+            })
             print(f"  Found {len(image_data_list)} cached images for multimodal embedding")
+
+        _notify(progress_callback, "embedding_storing", {
+            "total_chunks": len(all_chunks),
+            "text_chunks": len(text_chunks),
+            "structured_chunks": len(structured_chunks),
+            "message": f"Embedding and storing {len(all_chunks)} knowledge chunks ({len(text_chunks)} text + {len(structured_chunks)} structured)",
+        })
 
         try:
             stored_count = await chunk_embed_and_store(
@@ -508,15 +574,27 @@ async def run_pipeline_for_municipality(
                 image_data_list=image_data_list if image_data_list else None,
             )
             await session.commit()
+            _notify(progress_callback, "embedding_done", {
+                "chunks_stored": stored_count,
+                "message": f"Successfully embedded and stored {stored_count} chunks in vector database",
+            })
             print(f"  Embedded and stored {stored_count} chunks for RAG")
         except Exception as e:
+            _notify(progress_callback, "embedding_warning", {
+                "message": f"Embedding partially failed: {e}",
+            })
             print(f"  [WARN] Embedding failed (non-fatal): {e}")
         finally:
             clear_pdf_cache()
             clear_image_cache()
 
     await engine.dispose()
-    _notify(progress_callback, "completed", {"regulations": len(regulations), "policies": len(policies)})
+    _notify(progress_callback, "completed", {
+        "regulations": len(regulations),
+        "policies": len(policies),
+        "urls_scraped": len(source_urls),
+        "message": f"Done! {len(regulations)} regulations and {len(policies)} policies loaded for {municipality}",
+    })
     print(f"[DONE] Stored {len(regulations)} regulations and {len(policies)} policies for {municipality}")
 
     return {

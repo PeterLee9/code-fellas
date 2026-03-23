@@ -16,7 +16,6 @@ from backend.models.database import ScrapeLogDB
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
-# In-memory job tracking (resets on server restart)
 _jobs: dict[str, dict[str, Any]] = {}
 
 
@@ -32,20 +31,30 @@ class PipelineRunResponse(BaseModel):
 
 
 def _progress_callback(job_id: str):
-    """Create a progress callback for a specific job."""
+    """Create a progress callback that accumulates a detailed event log."""
     def callback(step: str, data: dict[str, Any]):
-        if job_id in _jobs:
-            _jobs[job_id]["current_step"] = step
-            _jobs[job_id]["step_data"] = data
-            if step == "completed":
-                _jobs[job_id]["status"] = "completed"
-                _jobs[job_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
-                _jobs[job_id]["regulations_found"] = data.get("regulations", 0)
-                _jobs[job_id]["policies_found"] = data.get("policies", 0)
-            elif step == "failed":
-                _jobs[job_id]["status"] = "failed"
-                _jobs[job_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
-                _jobs[job_id]["error"] = data.get("error", "unknown")
+        if job_id not in _jobs:
+            return
+        job = _jobs[job_id]
+        job["current_step"] = step
+        job["step_data"] = data
+
+        event = {
+            "step": step,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **data,
+        }
+        job["events"].append(event)
+
+        if step == "completed":
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["regulations_found"] = data.get("regulations", 0)
+            job["policies_found"] = data.get("policies", 0)
+        elif step == "failed":
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["error"] = data.get("error", "unknown")
     return callback
 
 
@@ -88,6 +97,7 @@ async def run_pipeline(request: PipelineRunRequest):
             )
 
     job_id = str(uuid.uuid4())[:8]
+    now = datetime.now(timezone.utc).isoformat()
     _jobs[job_id] = {
         "job_id": job_id,
         "municipality": request.municipality,
@@ -95,11 +105,12 @@ async def run_pipeline(request: PipelineRunRequest):
         "status": "running",
         "current_step": "queued",
         "step_data": {},
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": now,
         "completed_at": None,
         "regulations_found": 0,
         "policies_found": 0,
         "error": None,
+        "events": [{"step": "queued", "timestamp": now}],
     }
 
     asyncio.create_task(_run_pipeline_task(job_id, request.municipality, request.province))

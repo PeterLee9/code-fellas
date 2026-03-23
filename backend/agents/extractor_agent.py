@@ -1,7 +1,7 @@
 """LLM-based structured extraction for zoning data."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Any
 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -146,7 +146,7 @@ Text chunk {i + 1} of {len(text_chunks)}:
             raw_text_excerpt=excerpt or raw_text[:500],
             confidence_score=zone.confidence_score,
             needs_review=False,
-            extraction_date=datetime.now(timezone.utc),
+            extraction_date=datetime.utcnow(),
         )
         reg = validate_zoning_regulation(reg)
         reg.restrictiveness_score = compute_restrictiveness_score(reg)
@@ -204,7 +204,7 @@ entry in the policies list.
             raw_text_excerpt=raw_text[:500],
             confidence_score=pol.confidence_score,
             needs_review=pol.confidence_score < get_settings().confidence_threshold,
-            extraction_date=datetime.now(timezone.utc),
+            extraction_date=datetime.utcnow(),
         )
         policies.append(policy)
 

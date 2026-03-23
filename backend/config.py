@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     tavily_api_key: str
 
     # Gemini model names
-    extraction_model: str = "gemini-3-flash-preview"
-    agent_model: str = "gemini-3-flash-preview"
+    extraction_model: str = "gemini-3.1-flash-lite-preview"
+    agent_model: str = "gemini-3.1-flash-lite-preview"
     embedding_model: str = "gemini-embedding-2-preview"
 
     # Scraping config

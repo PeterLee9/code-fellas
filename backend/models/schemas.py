@@ -154,9 +154,15 @@ class ScrapeLogRead(ScrapeLogCreate):
     model_config = {"from_attributes": True}
 
 
+class ChatHistoryMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
 class ChatRequest(BaseModel):
     question: str
     municipality: str | None = None
+    history: list[ChatHistoryMessage] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):

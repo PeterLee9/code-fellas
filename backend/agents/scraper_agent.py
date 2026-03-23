@@ -48,6 +48,12 @@ async def scrape_webpage(url: str) -> str:
     Use this to read municipal zoning bylaw pages, official plans, and data portals.
     Also reports any zoning map or diagram images found on the page.
     """
+    if url.lower().split("?")[0].split("#")[0].endswith(".pdf"):
+        try:
+            return await download_and_extract_pdf_with_ocr(url)
+        except Exception as e:
+            return f"Error extracting PDF from {url}: {e}"
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -80,6 +86,22 @@ async def scrape_webpage(url: str) -> str:
                         if any(kw in src_lower for kw in _SKIP_IMAGE_KEYWORDS):
                             continue
                         image_urls.append(src)
+
+                # Extract PDF links from the page
+                pdf_urls: list[str] = []
+                if hasattr(result, "links") and result.links:
+                    for link_group in (result.links.get("internal", []), result.links.get("external", [])):
+                        for link in link_group:
+                            href = link.get("href", "") if isinstance(link, dict) else str(link)
+                            if href and href.lower().split("?")[0].split("#")[0].endswith(".pdf"):
+                                if href not in pdf_urls:
+                                    pdf_urls.append(href)
+
+                if pdf_urls:
+                    text += "\n\n## PDF documents found on this page:\n"
+                    for pdf_url in pdf_urls[:10]:
+                        text += f"- {pdf_url}\n"
+                    text += "\nUse download_and_extract_pdf to download and extract text from these PDF documents.\n"
 
                 if image_urls:
                     text += "\n\n## Images found on this page:\n"
@@ -173,7 +195,6 @@ async def search_web(query: str) -> str:
             query,
             max_results=8,
             search_depth="advanced",
-            include_domains=["*.ca", "*.gc.ca", "civic.band"],
         )
         results = []
         for r in response.get("results", []):

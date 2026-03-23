@@ -11,7 +11,7 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Annotated, Any, TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, StateGraph
@@ -75,12 +75,34 @@ You have access to a PostgreSQL database with comprehensive zoning data. Use the
 ## Tool Selection Guide
 
 - **query_database**: Use for structured data questions -- counts, averages, comparisons, rankings, filtering, aggregations. Write standard PostgreSQL SQL. Always use SELECT only.
-- **search_knowledge_base**: Use for semantic / conceptual questions about bylaw text, policy intent, or when you need to find relevant document passages. Searches embedded document chunks via vector similarity.
-- **search_web**: Use ONLY when the database lacks data for the user's question, or they ask about a municipality not yet in the system.
+- **search_knowledge_base**: Use for conceptual questions, policy intent, bylaw text details, or to find relevant document passages via vector similarity. Also use this to ENRICH answers from SQL with additional context from source documents.
+- **search_web**: Use ONLY for general zoning concept questions (e.g. "what is inclusionary zoning?"), NOT for questions about specific municipalities.
+
+## IMPORTANT: Use Multiple Tools for Rich Answers
+
+For most municipality-specific questions, you should call BOTH query_database AND search_knowledge_base:
+1. First use query_database to get the structured data (zone codes, numbers, regulations).
+2. Then use search_knowledge_base to find relevant bylaw text, policy context, or document excerpts that add depth to your answer.
+
+This gives the user both precise data AND the context/reasoning from the actual bylaw documents.
+
+Example: "What residential zones does Toronto have?"
+- Step 1: SQL to get zone codes and names from zoning_regulations
+- Step 2: search_knowledge_base("Toronto residential zones permitted uses setbacks") to get bylaw text with details
+- Step 3: Combine both into a comprehensive answer
+
+## Critical Rule: Only Answer From Scraped Data
+
+You must ONLY answer questions about municipalities that already exist in the database. Before answering any municipality-specific question:
+1. First query the `municipalities` table to check if the city exists: `SELECT name FROM municipalities`
+2. If the municipality is NOT in the database, do NOT attempt to answer using web search or speculation. Instead respond:
+   "**[City name] hasn't been added to ZoneMap yet.** To get zoning data for this city, go to the **Admin** page and run the scraping pipeline. Once the data is loaded, I'll be able to answer your questions about it."
+3. NEVER use search_web to look up zoning data for a specific municipality. Web search is only for general zoning concepts.
 
 ## Rules
 
 - You may call multiple tools, or the same tool multiple times, before answering.
+- For most questions, use at LEAST 2 tool calls to provide comprehensive answers.
 - Always cite specific zone codes (e.g. R1, C2), municipalities, and numerical values.
 - When comparing municipalities, use actual numbers from query results.
 - If data is missing or insufficient, say so rather than guessing.
@@ -200,11 +222,15 @@ def _build_tools(db: AsyncSession):
         parts = []
         for row in rows:
             chunk_type = row[6]
-            label = f"[{row[1]} - {row[3]}]"
+            source_url = row[2] or ""
+            source_doc = row[3] or ""
+            label = f"[{row[1]} - {source_doc}]"
             if chunk_type == "image":
                 label += " (Zoning Map)"
             elif chunk_type == "pdf_page":
                 label += " (PDF Page)"
+            if source_url:
+                label += f"\nSource: {source_url}"
             parts.append(f"{label}\n{row[4]}")
 
         return f"Found {len(rows)} relevant chunks:\n\n" + "\n\n---\n\n".join(parts)
@@ -223,7 +249,6 @@ def _build_tools(db: AsyncSession):
                 query,
                 max_results=5,
                 search_depth="advanced",
-                include_domains=["*.ca", "*.gc.ca", "civic.band"],
             )
             results = []
             for r in response.get("results", []):
@@ -240,60 +265,127 @@ def _build_tools(db: AsyncSession):
 # ---------------------------------------------------------------------------
 # Source extraction helpers
 # ---------------------------------------------------------------------------
+_URL_PATTERN = re.compile(r"https?://[^\s\)\]\",>]+")
+
+
 def _extract_sources_from_messages(messages: list) -> list[dict]:
-    """Extract source metadata from tool call arguments and results."""
+    """Extract source metadata from tool calls AND their results."""
     sources: list[dict] = []
     seen: set[str] = set()
 
+    tool_call_map: dict[str, tuple[str, dict]] = {}
     for msg in messages:
-        if not isinstance(msg, AIMessage) or not msg.tool_calls:
-            continue
-        for tc in msg.tool_calls:
-            name = tc.get("name", "")
-            args = tc.get("args", {})
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tc_id = tc.get("id", "")
+                if tc_id:
+                    tool_call_map[tc_id] = (tc.get("name", ""), tc.get("args", {}))
 
-            if name == "query_database":
-                sql_text = args.get("sql", "")
-                tables_mentioned = []
-                for tbl in ("zoning_regulations", "official_plan_policies", "municipalities"):
-                    if tbl in sql_text.lower():
-                        tables_mentioned.append(tbl)
-                if tables_mentioned:
-                    key = f"sql:{','.join(tables_mentioned)}"
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                name = tc.get("name", "")
+                args = tc.get("args", {})
+
+                if name == "query_database":
+                    sql_text = args.get("sql", "")
+                    tables_mentioned = []
+                    for tbl in ("zoning_regulations", "official_plan_policies", "municipalities"):
+                        if tbl in sql_text.lower():
+                            tables_mentioned.append(tbl)
+                    if tables_mentioned:
+                        key = f"sql:{sql_text[:80]}"
+                        if key not in seen:
+                            seen.add(key)
+                            sources.append({
+                                "municipality": "",
+                                "zone_code": "",
+                                "source_url": "",
+                                "source_document": f"SQL query on {', '.join(tables_mentioned)}",
+                                "type": "sql",
+                                "sql": sql_text,
+                            })
+
+        elif isinstance(msg, ToolMessage):
+            tc_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else ""
+            tool_info = tool_call_map.get(tc_id)
+            if not tool_info:
+                continue
+            name, args = tool_info
+            output = msg.content if hasattr(msg, "content") else ""
+            if isinstance(output, list):
+                output = " ".join(str(p) for p in output)
+            output = str(output) if output else ""
+
+            if name == "search_knowledge_base":
+                urls = _URL_PATTERN.findall(output)
+                unique_urls: list[str] = []
+                for u in urls:
+                    u = u.rstrip(".,;:)")
+                    if u not in unique_urls:
+                        unique_urls.append(u)
+                if unique_urls:
+                    for url in unique_urls[:4]:
+                        key = f"kb:{url}"
+                        if key not in seen:
+                            seen.add(key)
+                            try:
+                                from urllib.parse import urlparse
+                                domain = urlparse(url).netloc
+                            except Exception:
+                                domain = url[:40]
+                            sources.append({
+                                "municipality": args.get("municipality", ""),
+                                "zone_code": "",
+                                "source_url": url,
+                                "source_document": domain,
+                                "type": "document_chunk",
+                            })
+                else:
+                    muni = args.get("municipality", "")
+                    key = f"kb:{muni}:{args.get('query', '')[:50]}"
+                    if key not in seen:
+                        seen.add(key)
+                        sources.append({
+                            "municipality": muni,
+                            "zone_code": "",
+                            "source_url": "",
+                            "source_document": "Knowledge Base",
+                            "type": "document_chunk",
+                        })
+
+            elif name == "search_web":
+                urls = _URL_PATTERN.findall(output)
+                added = 0
+                for u in urls:
+                    u = u.rstrip(".,;:)")
+                    key = f"web:{u}"
+                    if key not in seen and added < 3:
+                        seen.add(key)
+                        try:
+                            from urllib.parse import urlparse
+                            domain = urlparse(u).netloc
+                        except Exception:
+                            domain = u[:40]
+                        sources.append({
+                            "municipality": "",
+                            "zone_code": "",
+                            "source_url": u,
+                            "source_document": domain,
+                            "type": "web",
+                        })
+                        added += 1
+                if added == 0:
+                    key = f"web:{args.get('query', '')[:50]}"
                     if key not in seen:
                         seen.add(key)
                         sources.append({
                             "municipality": "",
                             "zone_code": "",
                             "source_url": "",
-                            "source_document": f"SQL query on {', '.join(tables_mentioned)}",
-                            "type": "sql",
+                            "source_document": f"Web: {args.get('query', '')}",
+                            "type": "web",
                         })
-
-            elif name == "search_knowledge_base":
-                muni = args.get("municipality", "")
-                key = f"kb:{muni}:{args.get('query', '')[:50]}"
-                if key not in seen:
-                    seen.add(key)
-                    sources.append({
-                        "municipality": muni,
-                        "zone_code": "",
-                        "source_url": "",
-                        "source_document": "Knowledge Base Search",
-                        "type": "document_chunk",
-                    })
-
-            elif name == "search_web":
-                key = f"web:{args.get('query', '')[:50]}"
-                if key not in seen:
-                    seen.add(key)
-                    sources.append({
-                        "municipality": "",
-                        "zone_code": "",
-                        "source_url": "",
-                        "source_document": f"Web search: {args.get('query', '')}",
-                        "type": "web",
-                    })
 
     return sources
 
@@ -374,6 +466,76 @@ def _summarize_tool_result(name: str, output: str) -> str:
     return "Processing results..."
 
 
+def _extract_tool_detail(name: str, args: dict) -> str:
+    """Extract a human-readable detail string from tool arguments."""
+    if name == "query_database":
+        sql = args.get("sql", "")
+        if len(sql) > 200:
+            sql = sql[:200] + "..."
+        return sql
+    if name == "search_knowledge_base":
+        q = args.get("query", "")
+        muni = args.get("municipality", "")
+        detail = f'"{q}"'
+        if muni:
+            detail += f" in {muni}"
+        return detail
+    if name == "search_web":
+        return f'"{args.get("query", "")}"'
+    return ""
+
+
+def _extract_result_preview(name: str, output: str) -> str:
+    """Extract a short preview of the tool output for display."""
+    if name == "query_database":
+        lines = output.strip().split("\n")
+        if len(lines) > 3:
+            header = lines[1]
+            first_rows = lines[3:6]
+            return header + "\n" + "\n".join(first_rows)
+    if name == "search_knowledge_base":
+        chunks = output.split("---")
+        previews = []
+        for chunk in chunks[:3]:
+            chunk = chunk.strip()
+            if chunk.startswith("Found"):
+                continue
+            label_end = chunk.find("\n")
+            if label_end > 0:
+                label = chunk[:label_end].strip()
+                previews.append(label)
+        if previews:
+            return "\n".join(previews)
+    if name == "search_web":
+        titles = re.findall(r"\*\*(.+?)\*\*", output)
+        if titles:
+            return "\n".join(titles[:3])
+    return ""
+
+
+def _build_history_messages(
+    history: list[dict[str, str]] | None,
+) -> list[HumanMessage | AIMessage]:
+    """Convert frontend chat history into LangChain message objects.
+
+    Only keeps the last 10 turns (20 messages) to stay within context limits.
+    """
+    if not history:
+        return []
+    msgs: list[HumanMessage | AIMessage] = []
+    trimmed = history[-20:]
+    for entry in trimmed:
+        role = entry.get("role", "")
+        content = entry.get("content", "")
+        if not content:
+            continue
+        if role == "user":
+            msgs.append(HumanMessage(content=content))
+        elif role == "assistant":
+            msgs.append(AIMessage(content=content))
+    return msgs
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -381,6 +543,7 @@ async def agentic_chat_answer(
     question: str,
     db: AsyncSession,
     municipality: str | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """
     Answer a zoning question using the agentic RAG chat agent.
@@ -397,9 +560,12 @@ async def agentic_chat_answer(
     if municipality:
         user_msg = f"[Context: the user is asking about {municipality}]\n\n{question}"
 
+    history_msgs = _build_history_messages(history)
+
     initial_state: ChatAgentState = {
         "messages": [
             SystemMessage(content=SYSTEM_PROMPT),
+            *history_msgs,
             HumanMessage(content=user_msg),
         ],
         "sources": [],
@@ -431,6 +597,7 @@ async def agentic_chat_stream(
     question: str,
     db: AsyncSession,
     municipality: str | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Stream the agent's thought process and answer as SSE events.
@@ -449,9 +616,12 @@ async def agentic_chat_stream(
     if municipality:
         user_msg = f"[Context: the user is asking about {municipality}]\n\n{question}"
 
+    history_msgs = _build_history_messages(history)
+
     initial_state: ChatAgentState = {
         "messages": [
             SystemMessage(content=SYSTEM_PROMPT),
+            *history_msgs,
             HumanMessage(content=user_msg),
         ],
         "sources": [],
@@ -470,14 +640,18 @@ async def agentic_chat_stream(
             name = event.get("name", "")
 
             if kind == "on_tool_start" and name in TOOL_DESCRIPTIONS:
-                yield f"data: {json.dumps({'type': 'tool_start', 'name': name, 'description': TOOL_DESCRIPTIONS[name]})}\n\n"
+                input_data = event.get("data", {}).get("input", {})
+                args = input_data if isinstance(input_data, dict) else {}
+                detail = _extract_tool_detail(name, args)
+                yield f"data: {json.dumps({'type': 'tool_start', 'name': name, 'description': TOOL_DESCRIPTIONS[name], 'detail': detail})}\n\n"
 
             elif kind == "on_tool_end" and name in TOOL_DESCRIPTIONS:
                 output = event.get("data", {}).get("output", "")
                 if not isinstance(output, str):
                     output = str(output)
                 summary = _summarize_tool_result(name, output)
-                yield f"data: {json.dumps({'type': 'tool_end', 'name': name, 'summary': summary})}\n\n"
+                preview = _extract_result_preview(name, output)
+                yield f"data: {json.dumps({'type': 'tool_end', 'name': name, 'summary': summary, 'preview': preview})}\n\n"
 
             elif kind == "on_chat_model_stream":
                 chunk = event.get("data", {}).get("chunk")

@@ -11,6 +11,10 @@ from backend.rag.chat_agent import agentic_chat_answer, agentic_chat_stream
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
+def _history_to_dicts(request: ChatRequest) -> list[dict[str, str]]:
+    return [{"role": m.role, "content": m.content} for m in request.history]
+
+
 @router.post("", response_model=ChatResponse)
 async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
     """Agentic RAG chat: LangGraph agent with SQL, vector search, and web search tools."""
@@ -18,6 +22,7 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
         question=request.question,
         db=db,
         municipality=request.municipality,
+        history=_history_to_dicts(request),
     )
 
     return ChatResponse(
@@ -34,6 +39,7 @@ async def chat_stream(request: ChatRequest, db: AsyncSession = Depends(get_db)):
             question=request.question,
             db=db,
             municipality=request.municipality,
+            history=_history_to_dicts(request),
         ),
         media_type="text/event-stream",
         headers={
